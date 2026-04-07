@@ -10,6 +10,7 @@ Run via systemd (see virtual-employee.service) for reliable 24/7 operation.
 """
 
 import os
+import re
 import subprocess
 import logging
 import time
@@ -45,6 +46,7 @@ CLAUDE_TIMEOUT  = 240    # seconds to wait for Claude (4 minutes)
 
 EMPLOYEE_NAME  = "Phelix Beeblebrox"
 EMPLOYEE_EMAIL = "phelixbeeblebrox@gmail.com"
+ADMIN_EMAIL    = "o.t.richman@gmail.com"   # Only this address can issue admin commands
 
 # Senders/subjects to silently ignore
 SKIP_SENDERS = [
@@ -136,6 +138,96 @@ def parse_email(msg):
         'msg_id':  headers.get('message-id', ''),
         'body':    body.strip(),
     }
+
+
+# ─────────────────────────────────────────────
+#  Admin command handling
+# ─────────────────────────────────────────────
+
+EMAIL_RE = re.compile(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b')
+
+def parse_admin_command(email_data):
+    """
+    If the email is from the admin (Oliver), look for whitelist management commands.
+    Returns a dict like {'action': 'add', 'target': 'alice@example.com'}
+    or {'action': 'list'}, or None if no command detected.
+    """
+    if extract_email_address(email_data['sender']) != ADMIN_EMAIL:
+        return None
+
+    body  = email_data['body'].lower()
+    # Find any email addresses mentioned in the body (excluding Phelix's own)
+    found = [e.lower() for e in EMAIL_RE.findall(email_data['body'])
+             if e.lower() != EMPLOYEE_EMAIL and e.lower() != ADMIN_EMAIL]
+
+    add_words    = ['add', 'allow', 'whitelist', 'approve', 'include']
+    remove_words = ['remove', 'delete', 'block', 'revoke', 'exclude', 'ban']
+    list_phrases = ['show whitelist', 'list whitelist', 'who can email',
+                    'who is on the whitelist', 'who is allowed']
+
+    if found and any(w in body for w in add_words):
+        return {'action': 'add', 'target': found[0]}
+
+    if found and any(w in body for w in remove_words):
+        return {'action': 'remove', 'target': found[0]}
+
+    if any(p in body for p in list_phrases):
+        return {'action': 'list'}
+
+    return None
+
+
+def execute_admin_command(command):
+    """
+    Carry out an admin whitelist command and return a plain-English result
+    string that gets passed to Claude so Phelix can confirm it naturally.
+    """
+    action = command['action']
+
+    # Read the current file lines (preserving comments)
+    comment_lines = []
+    addresses = set()
+    if os.path.exists(WHITELIST_FILE):
+        with open(WHITELIST_FILE, 'r') as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith('#') or not stripped:
+                    comment_lines.append(line)
+                else:
+                    addresses.add(stripped.lower())
+
+    def save():
+        with open(WHITELIST_FILE, 'w') as f:
+            f.writelines(comment_lines)
+            for addr in sorted(addresses):
+                f.write(addr + '\n')
+
+    if action == 'add':
+        target = command['target']
+        if target in addresses:
+            return f"Note: '{target}' was already on the whitelist — no change made."
+        addresses.add(target)
+        save()
+        logger.info(f"Admin: added {target} to whitelist")
+        return f"Done — I've added '{target}' to the whitelist. They can now email me."
+
+    elif action == 'remove':
+        target = command['target']
+        if target not in addresses:
+            return f"Note: '{target}' was not found on the whitelist — no change made."
+        addresses.discard(target)
+        save()
+        logger.info(f"Admin: removed {target} from whitelist")
+        return f"Done — I've removed '{target}' from the whitelist. Their emails will be ignored."
+
+    elif action == 'list':
+        if addresses:
+            formatted = '\n'.join(f"  • {a}" for a in sorted(addresses))
+            return f"Current whitelist ({len(addresses)} address(es)):\n{formatted}"
+        else:
+            return "The whitelist file is empty, so all senders are currently allowed."
+
+    return "Unknown command."
 
 
 def load_whitelist():
@@ -270,7 +362,7 @@ and end with the sign-off. No extra commentary outside the email.
 """
 
 
-def call_claude(email_data):
+def call_claude(email_data, admin_result=None):
     today  = datetime.now().strftime('%A, %B %-d, %Y')
     prompt = PROMPT_TEMPLATE.format(
         name    = EMPLOYEE_NAME,
@@ -280,6 +372,9 @@ def call_claude(email_data):
         date    = email_data['date'],
         body    = email_data['body'],
     )
+
+    if admin_result:
+        prompt += f"\n\nADMIN ACTION RESULT: {admin_result}\nPlease confirm this to Oliver naturally in your reply."
 
     cmd = ['claude', '-p', prompt]
     if os.path.exists(MCP_CONFIG_FILE):
@@ -327,7 +422,15 @@ def process_email(service, msg):
         mark_as_read(service, data['id'])
         return
 
-    reply = call_claude(data)
+    # Check for admin commands before calling Claude
+    admin_result = None
+    admin_cmd = parse_admin_command(data)
+    if admin_cmd:
+        logger.info(f"Admin command detected: {admin_cmd}")
+        admin_result = execute_admin_command(admin_cmd)
+        logger.info(f"Admin result: {admin_result}")
+
+    reply = call_claude(data, admin_result=admin_result)
     if reply:
         if send_reply(service, msg, reply):
             mark_as_read(service, data['id'])

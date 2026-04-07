@@ -1,0 +1,41 @@
+# Auto-Deploy Service
+# ====================
+# Watches GitHub for new commits and auto-updates Phelix.
+#
+# INSTALL (one time only):
+#   1. Allow passwordless restart of virtual-employee:
+#      echo "o_t_richman ALL=(ALL) NOPASSWD: /bin/systemctl restart virtual-employee" | sudo tee /etc/sudoers.d/auto-deploy
+#
+#   2. Install and start this service:
+#      sudo cp ~/virtual-employee/auto-deploy.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable auto-deploy
+#      sudo systemctl start auto-deploy
+#
+# After that: just push to GitHub. Phelix updates within 5 minutes.
+# Check deploy log: tail -f ~/virtual-employee/logs/auto_deploy.log
+
+[Unit]
+Description=Phelix Auto-Deploy (polls GitHub every 5 min)
+After=network-online.target virtual-employee.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=o_t_richman
+WorkingDirectory=/home/o_t_richman/virtual-employee
+
+ExecStart=/bin/bash /home/o_t_richman/virtual-employee/auto_deploy.sh
+
+Restart=always
+RestartSec=10
+
+Environment="HOME=/home/o_t_richman"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=auto-deploy
+
+[Install]
+WantedBy=multi-user.target

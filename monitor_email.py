@@ -32,6 +32,8 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
     'https://www.googleapis.com/auth/calendar',
     'https://www.googleapis.com/auth/drive.file',
+    'https://www.googleapis.com/auth/documents',
+    'https://www.googleapis.com/auth/spreadsheets',
 ]
 
 BASE_DIR          = os.path.expanduser('~/virtual-employee')
@@ -320,6 +322,155 @@ def send_reply(service, original, reply_text):
 
 
 # ─────────────────────────────────────────────
+#  Google Docs / Sheets creation
+# ─────────────────────────────────────────────
+
+DOC_KEYWORDS   = ['create a doc', 'make a doc', 'write a doc', 'create a document',
+                  'make a document', 'write a document', 'create a report', 'write a report',
+                  'draft a document', 'put together a document']
+SHEET_KEYWORDS = ['create a spreadsheet', 'make a spreadsheet', 'create a sheet',
+                  'make a sheet', 'build a spreadsheet', 'create a table',
+                  'make a table', 'create a budget', 'make a budget', 'create a tracker']
+
+DOC_CONTENT_PROMPT = """\
+You are {name}, an AI executive secretary. Oliver has asked you to create a Google Document.
+
+His request:
+{body}
+
+Generate the full content for this document.
+
+Your response MUST follow this exact format — no deviations:
+
+TITLE: [a concise, descriptive document title]
+---
+[the complete document content here, using plain text with blank lines between sections]
+"""
+
+SHEET_CONTENT_PROMPT = """\
+You are {name}, an AI executive secretary. Oliver has asked you to create a Google Spreadsheet.
+
+His request:
+{body}
+
+Generate the content for this spreadsheet as tab-separated values (TSV).
+
+Your response MUST follow this exact format — no deviations:
+
+TITLE: [a concise, descriptive spreadsheet title]
+---
+[header row with columns separated by tabs]
+[data row 1 with values separated by tabs]
+[data row 2 with values separated by tabs]
+...
+"""
+
+
+def detect_document_request(email_data):
+    """Return 'doc', 'sheet', or None based on email content."""
+    body = email_data['body'].lower()
+    subj = email_data['subject'].lower()
+    text = body + ' ' + subj
+    if any(k in text for k in SHEET_KEYWORDS):
+        return 'sheet'
+    if any(k in text for k in DOC_KEYWORDS):
+        return 'doc'
+    return None
+
+
+def generate_document_content(email_data, doc_type, creds_for_claude=None):
+    """
+    Ask Claude to generate the title and content for a document.
+    Returns (title, content_string) or (None, None) on failure.
+    """
+    template = SHEET_CONTENT_PROMPT if doc_type == 'sheet' else DOC_CONTENT_PROMPT
+    prompt = template.format(name=EMPLOYEE_NAME, body=email_data['body'])
+
+    try:
+        result = subprocess.run(
+            ['claude', '-p', prompt],
+            capture_output=True, text=True, timeout=CLAUDE_TIMEOUT, cwd=BASE_DIR,
+            env={**os.environ, 'HOME': os.path.expanduser('~')},
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            logger.error(f"Claude failed generating document content: {result.stderr[:200]}")
+            return None, None
+
+        output = result.stdout.strip()
+
+        # Parse TITLE: ... \n --- \n content
+        if 'TITLE:' not in output or '---' not in output:
+            logger.error("Claude output didn't match expected format for document")
+            return None, None
+
+        parts = output.split('---', 1)
+        title_line = parts[0].strip()
+        content    = parts[1].strip() if len(parts) > 1 else ''
+        title = title_line.replace('TITLE:', '').strip()
+
+        return title, content
+
+    except Exception as e:
+        logger.error(f"Error generating document content: {e}")
+        return None, None
+
+
+def create_google_doc(creds, title, content):
+    """Create a Google Doc with the given content. Returns the URL."""
+    try:
+        docs_service = build('docs', 'v1', credentials=creds)
+
+        # Create the document
+        doc = docs_service.documents().create(
+            body={'title': title}
+        ).execute()
+        doc_id = doc['documentId']
+
+        # Insert the content
+        if content:
+            docs_service.documents().batchUpdate(
+                documentId=doc_id,
+                body={'requests': [
+                    {'insertText': {'location': {'index': 1}, 'text': content}}
+                ]}
+            ).execute()
+
+        url = f"https://docs.google.com/document/d/{doc_id}/edit"
+        logger.info(f"Created Google Doc: {title} → {url}")
+        return url
+
+    except HttpError as e:
+        logger.error(f"Failed to create Google Doc: {e}")
+        return None
+
+
+def create_google_sheet(creds, title, tsv_content):
+    """Create a Google Sheet from tab-separated content. Returns the URL."""
+    try:
+        sheets_service = build('sheets', 'v4', credentials=creds)
+
+        # Parse TSV into rows
+        rows = []
+        for line in tsv_content.strip().splitlines():
+            cells = line.split('\t')
+            rows.append({'values': [{'userEnteredValue': {'stringValue': c.strip()}} for c in cells]})
+
+        sheet = sheets_service.spreadsheets().create(body={
+            'properties': {'title': title},
+            'sheets': [{'data': [{'rowData': rows}]}] if rows else []
+        }).execute()
+
+        sheet_id = sheet['spreadsheetId']
+        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+        logger.info(f"Created Google Sheet: {title} → {url}")
+        return url
+
+    except HttpError as e:
+        logger.error(f"Failed to create Google Sheet: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
 #  Claude Code invocation
 # ─────────────────────────────────────────────
 
@@ -362,7 +513,7 @@ and end with the sign-off. No extra commentary outside the email.
 """
 
 
-def call_claude(email_data, admin_result=None):
+def call_claude(email_data, admin_result=None, doc_url=None, doc_title=None, doc_type=None):
     today  = datetime.now().strftime('%A, %B %-d, %Y')
     prompt = PROMPT_TEMPLATE.format(
         name    = EMPLOYEE_NAME,
@@ -375,6 +526,15 @@ def call_claude(email_data, admin_result=None):
 
     if admin_result:
         prompt += f"\n\nADMIN ACTION RESULT: {admin_result}\nPlease confirm this to Oliver naturally in your reply."
+
+    if doc_url and doc_title:
+        kind = 'spreadsheet' if doc_type == 'sheet' else 'document'
+        prompt += (f"\n\nDOCUMENT CREATED: The {kind} '{doc_title}' has been created successfully."
+                   f"\nURL: {doc_url}"
+                   f"\nPlease let the sender know it's ready and include the link in your reply.")
+    elif doc_url is False:
+        prompt += ("\n\nDOCUMENT CREATION FAILED: An attempt was made to create the document "
+                   "but a technical error occurred. Please apologise and let the sender know.")
 
     cmd = ['claude', '-p', prompt]
     if os.path.exists(MCP_CONFIG_FILE):
@@ -422,7 +582,10 @@ def process_email(service, msg):
         mark_as_read(service, data['id'])
         return
 
-    # Check for admin commands before calling Claude
+    # Get credentials for document creation (reuse token already loaded)
+    creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+
+    # Check for admin commands
     admin_result = None
     admin_cmd = parse_admin_command(data)
     if admin_cmd:
@@ -430,7 +593,25 @@ def process_email(service, msg):
         admin_result = execute_admin_command(admin_cmd)
         logger.info(f"Admin result: {admin_result}")
 
-    reply = call_claude(data, admin_result=admin_result)
+    # Check for document creation requests
+    doc_url = None
+    doc_title = None
+    doc_type = detect_document_request(data)
+    if doc_type:
+        logger.info(f"Document request detected: {doc_type}")
+        doc_title, doc_content = generate_document_content(data, doc_type)
+        if doc_title and doc_content:
+            if doc_type == 'sheet':
+                doc_url = create_google_sheet(creds, doc_title, doc_content)
+            else:
+                doc_url = create_google_doc(creds, doc_title, doc_content)
+            if not doc_url:
+                doc_url = False  # Signal failure to call_claude
+        else:
+            doc_url = False
+
+    reply = call_claude(data, admin_result=admin_result,
+                        doc_url=doc_url, doc_title=doc_title, doc_type=doc_type)
     if reply:
         if send_reply(service, msg, reply):
             mark_as_read(service, data['id'])

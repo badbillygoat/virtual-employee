@@ -1,0 +1,8 @@
+# Phelix's Allowed Senders
+# =========================
+# Only emails from addresses listed here will be processed.
+# One email address per line. Lines starting with # are comments.
+# To add someone: just add their email on a new line and save.
+# Changes take effect immediately — no restart needed.
+
+o.t.richman@gmail.com

@@ -20,18 +20,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=otric
-WorkingDirectory=/home/otric/virtual-employee
+User=o_t_richman
+WorkingDirectory=/home/o_t_richman/virtual-employee
 
-ExecStart=/usr/bin/python3 /home/otric/virtual-employee/monitor_email.py
+ExecStart=/usr/bin/python3 /home/o_t_richman/virtual-employee/monitor_email.py
 
 Restart=always
 RestartSec=30
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
-Environment="HOME=/home/otric"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/otric/.local/bin:/home/otric/.npm-global/bin"
+Environment="HOME=/home/o_t_richman"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/o_t_richman/.local/bin:/home/o_t_richman/.npm-global/bin"
 
 StandardOutput=journal
 StandardError=journal

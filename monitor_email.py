@@ -67,6 +67,9 @@ SKIP_SENDERS = [
 SKIP_SUBJECTS = [
     'unsubscribe', 'auto-reply', 'out of office', 'automatic reply',
     'delivery status', 'mail delivery failed',
+    'accept your invitation to join shared calendar',
+    'invitation to view calendar',
+    'has shared a calendar with you',
 ]
 
 # ─────────────────────────────────────────────
@@ -334,13 +337,6 @@ def send_reply(service, original, reply_text):
 #  Google Docs / Sheets creation
 # ─────────────────────────────────────────────
 
-DOC_KEYWORDS   = ['create a doc', 'make a doc', 'write a doc', 'create a document',
-                  'make a document', 'write a document', 'create a report', 'write a report',
-                  'draft a document', 'put together a document']
-SHEET_KEYWORDS = ['create a spreadsheet', 'make a spreadsheet', 'create a sheet',
-                  'make a sheet', 'build a spreadsheet', 'create a table',
-                  'make a table', 'create a budget', 'make a budget', 'create a tracker']
-
 DOC_CONTENT_PROMPT = """\
 You are {name}, an AI executive secretary. Oliver has asked you to create a Google Document.
 
@@ -376,14 +372,7 @@ TITLE: [a concise, descriptive spreadsheet title]
 
 
 def detect_document_request(email_data):
-    """Return 'doc', 'sheet', or None based on email content."""
-    body = email_data['body'].lower()
-    subj = email_data['subject'].lower()
-    text = body + ' ' + subj
-    if any(k in text for k in SHEET_KEYWORDS):
-        return 'sheet'
-    if any(k in text for k in DOC_KEYWORDS):
-        return 'doc'
+    # Replaced by Claude intent detection — see detect_intent()
     return None
 
 
@@ -485,20 +474,6 @@ def create_google_sheet(creds, title, tsv_content):
 
 from datetime import timedelta
 
-CREATE_EVENT_KEYWORDS = [
-    'schedule a meeting', 'schedule a call', 'schedule time',
-    'create a meeting', 'create a call', 'create an event', 'create a calendar',
-    'set up a meeting', 'set up a call', 'book a meeting', 'book a call',
-    'add to my calendar', 'add to calendar', 'calendar invite', 'send an invite',
-    'put on the calendar', 'block time', 'block off time',
-]
-CHECK_SCHEDULE_KEYWORDS = [
-    "what's my schedule", "what is my schedule", 'my schedule for',
-    'what do i have', "what's on my calendar", 'check my calendar',
-    'when am i free', 'am i free', 'my availability', 'check my availability',
-    'what are my meetings', 'do i have anything',
-]
-
 EVENT_DETAILS_PROMPT = """\
 You are {name}. Oliver has asked you to create a calendar event.
 
@@ -522,12 +497,7 @@ Do not add any text outside these six fields.
 
 
 def detect_calendar_request(email_data):
-    """Return 'create', 'check', or None."""
-    text = (email_data['body'] + ' ' + email_data['subject']).lower()
-    if any(k in text for k in CREATE_EVENT_KEYWORDS):
-        return 'create'
-    if any(k in text for k in CHECK_SCHEDULE_KEYWORDS):
-        return 'check'
+    # Replaced by Claude intent detection — see detect_intent()
     return None
 
 
@@ -778,6 +748,84 @@ def call_claude(email_data, admin_result=None, doc_url=None, doc_title=None, doc
 #  Main loop
 # ─────────────────────────────────────────────
 
+INTENT_PROMPT = """\
+Read this email and identify what actions are needed.
+Respond with ONLY these four lines, no other text:
+
+DOCUMENT: doc | sheet | none
+CALENDAR: create | check | none
+REPLY_NEEDED: yes | no
+REASON: [one short sentence explaining your classification]
+
+Definitions:
+- DOCUMENT doc   = wants a Google Doc / written report / text document created
+- DOCUMENT sheet = wants a Google Spreadsheet / table / budget / tracker created
+- CALENDAR create = wants an event, meeting, appointment, or reminder added to the calendar
+- CALENDAR check  = wants to know what's on the calendar / availability / schedule
+- REPLY_NEEDED no = purely automated (e.g. calendar invite, bounce, newsletter)
+
+EMAIL:
+Subject: {subject}
+From: {sender}
+Body:
+{body}
+"""
+
+
+def detect_intent(email_data):
+    """
+    Ask Claude to classify this email's intent in one fast call.
+    Returns a dict: {'document': 'doc'|'sheet'|None, 'calendar': 'create'|'check'|None}
+    """
+    prompt = INTENT_PROMPT.format(
+        subject = email_data['subject'],
+        sender  = email_data['sender'],
+        body    = email_data['body'][:3000],   # keep it short for speed
+    )
+    try:
+        result = subprocess.run(
+            ['claude', '-p', prompt],
+            capture_output=True, text=True, timeout=60, cwd=BASE_DIR,
+            env={**os.environ, 'HOME': os.path.expanduser('~')},
+        )
+        if result.returncode != 0:
+            logger.warning("Intent detection failed — treating as plain reply")
+            return {'document': None, 'calendar': None}
+
+        intent = {'document': None, 'calendar': None}
+        for line in result.stdout.strip().splitlines():
+            if line.upper().startswith('DOCUMENT:'):
+                val = line.split(':', 1)[1].strip().lower()
+                intent['document'] = val if val in ('doc', 'sheet') else None
+            elif line.upper().startswith('CALENDAR:'):
+                val = line.split(':', 1)[1].strip().lower()
+                intent['calendar'] = val if val in ('create', 'check') else None
+
+        logger.info(f"Intent detected: document={intent['document']}, calendar={intent['calendar']}")
+        return intent
+
+    except Exception as e:
+        logger.warning(f"Intent detection error: {e} — treating as plain reply")
+        return {'document': None, 'calendar': None}
+
+
+def ensure_oliver_calendar_accessible(creds):
+    """
+    Make sure Oliver's shared calendar is in Phelix's calendar list.
+    Safe to call every startup — skips silently if already added.
+    """
+    try:
+        service = build('calendar', 'v3', credentials=creds)
+        # Try to insert Oliver's calendar into Phelix's list (idempotent)
+        service.calendarList().insert(body={'id': OLIVER_CALENDAR_ID}).execute()
+        logger.info(f"Oliver's calendar ({OLIVER_CALENDAR_ID}) added to Phelix's calendar list")
+    except HttpError as e:
+        if e.resp.status == 409:
+            pass  # Already in list — that's fine
+        else:
+            logger.warning(f"Could not add Oliver's calendar to list: {e}")
+
+
 def process_email(service, msg):
     data = parse_email(msg)
     logger.info(f"Processing: '{data['subject']}' from {data['sender']}")
@@ -800,9 +848,16 @@ def process_email(service, msg):
     # Check for document creation requests
     doc_url = None
     doc_title = None
-    doc_type = detect_document_request(data)
+    # Ensure Oliver's shared calendar is accessible (fast no-op if already done)
+    ensure_oliver_calendar_accessible(creds)
+
+    # Use Claude to detect what actions this email needs
+    intent = detect_intent(data)
+
+    # Handle document creation
+    doc_type = intent['document']
     if doc_type:
-        logger.info(f"Document request detected: {doc_type}")
+        logger.info(f"Document request detected by intent: {doc_type}")
         doc_title, doc_content = generate_document_content(data, doc_type)
         if doc_title and doc_content:
             if doc_type == 'sheet':
@@ -814,14 +869,14 @@ def process_email(service, msg):
         else:
             doc_url = False
 
-    # Check for calendar requests
+    # Handle calendar requests
     calendar_action  = None
     calendar_url     = None
     calendar_details = None
     schedule_context = None
-    cal_type = detect_calendar_request(data)
+    cal_type = intent['calendar']
     if cal_type == 'create':
-        logger.info("Calendar create request detected")
+        logger.info("Calendar create request detected by intent")
         calendar_details = generate_event_details(data)
         if calendar_details:
             calendar_url = create_calendar_event(creds, calendar_details)
@@ -829,7 +884,7 @@ def process_email(service, msg):
         else:
             calendar_action = 'failed'
     elif cal_type == 'check':
-        logger.info("Calendar check request detected")
+        logger.info("Calendar check request detected by intent")
         schedule_context = get_oliver_schedule(creds)
         calendar_action  = 'check'
 

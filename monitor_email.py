@@ -59,6 +59,10 @@ OLIVER_TIMEZONE    = "America/New_York"          # ← change this if Oliver is 
 SKIP_SENDERS = [
     'no-reply', 'noreply', 'mailer-daemon', 'postmaster',
     'notifications@', 'bounce', 'do-not-reply', 'donotreply',
+    'calendar-notification@google.com',
+    'calendar-server.bounces.google.com',
+    '@accounts.google.com',
+    'googlecalendar-noreply@google.com',
 ]
 SKIP_SUBJECTS = [
     'unsubscribe', 'auto-reply', 'out of office', 'automatic reply',

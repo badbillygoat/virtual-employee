@@ -1,6 +1,7 @@
-# Never commit these — they contain secrets
+# Never commit these — they contain secrets or machine-specific IDs
 credentials.json
 token.json
+drive_folders.json
 *.json.bak
 
 # Logs

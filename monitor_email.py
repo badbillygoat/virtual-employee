@@ -11,6 +11,7 @@ Run via systemd (see virtual-employee.service) for reliable 24/7 operation.
 
 import os
 import re
+import json
 import subprocess
 import logging
 import time
@@ -40,7 +41,11 @@ BASE_DIR          = os.path.expanduser('~/virtual-employee')
 TOKEN_FILE        = os.path.join(BASE_DIR, 'token.json')
 LOG_FILE          = os.path.join(BASE_DIR, 'logs', 'monitor.log')
 MCP_CONFIG_FILE   = os.path.join(BASE_DIR, 'mcp_config.json')
-WHITELIST_FILE    = os.path.join(BASE_DIR, 'whitelist.txt')
+WHITELIST_FILE      = os.path.join(BASE_DIR, 'whitelist.txt')
+DRIVE_FOLDERS_FILE  = os.path.join(BASE_DIR, 'drive_folders.json')
+
+# Drive folder structure
+ROOT_FOLDER_NAME = 'Phelix - Virtual Employee'
 
 POLL_INTERVAL   = 120    # seconds between inbox checks (2 minutes)
 MAX_BODY_LENGTH = 8000   # truncate very long emails to avoid token limits
@@ -413,39 +418,136 @@ def generate_document_content(email_data, doc_type, creds_for_claude=None):
         return None, None
 
 
-def create_google_doc(creds, title, content):
-    """Create a Google Doc with the given content. Returns the URL."""
+def get_or_create_drive_folders(creds):
+    """
+    Ensure the Phelix folder structure exists in Drive and is shared with Oliver.
+    Returns {'root': id, 'docs': id, 'sheets': id}.
+    Caches IDs in drive_folders.json so subsequent calls are instant.
+    """
+    drive = build('drive', 'v3', credentials=creds)
+
+    # Load cached IDs and verify root still exists
+    if os.path.exists(DRIVE_FOLDERS_FILE):
+        with open(DRIVE_FOLDERS_FILE) as f:
+            folders = json.load(f)
+        try:
+            drive.files().get(fileId=folders['root']).execute()
+            return folders   # Cache is valid
+        except HttpError:
+            logger.info("Cached Drive folder not found — recreating")
+
+    def make_folder(name, parent_id=None):
+        body = {'name': name, 'mimeType': 'application/vnd.google-apps.folder'}
+        if parent_id:
+            body['parents'] = [parent_id]
+        return drive.files().create(body=body, fields='id').execute()['id']
+
+    # Create root folder and subfolders
+    root_id   = make_folder(ROOT_FOLDER_NAME)
+    docs_id   = make_folder('Documents',    root_id)
+    sheets_id = make_folder('Spreadsheets', root_id)
+
+    # Share root folder with Oliver as editor (subfolders inherit)
     try:
-        docs_service = build('docs', 'v1', credentials=creds)
-
-        # Create the document
-        doc = docs_service.documents().create(
-            body={'title': title}
+        drive.permissions().create(
+            fileId=root_id,
+            body={'type': 'user', 'role': 'writer', 'emailAddress': OLIVER_EMAIL},
+            sendNotificationEmail=False,
         ).execute()
-        doc_id = doc['documentId']
-
-        # Insert the content
-        if content:
-            docs_service.documents().batchUpdate(
-                documentId=doc_id,
-                body={'requests': [
-                    {'insertText': {'location': {'index': 1}, 'text': content}}
-                ]}
-            ).execute()
-
-        url = f"https://docs.google.com/document/d/{doc_id}/edit"
-        logger.info(f"Created Google Doc: {title} → {url}")
-        return url
-
+        logger.info(f"Drive folder '{ROOT_FOLDER_NAME}' created and shared with {OLIVER_EMAIL}")
     except HttpError as e:
-        logger.error(f"Failed to create Google Doc: {e}")
+        logger.warning(f"Could not share Drive folder with Oliver: {e}")
+
+    folders = {'root': root_id, 'docs': docs_id, 'sheets': sheets_id}
+    with open(DRIVE_FOLDERS_FILE, 'w') as f:
+        json.dump(folders, f, indent=2)
+
+    return folders
+
+
+def find_existing_file(creds, title, folder_id, mime_type):
+    """
+    Search for a file by title within a specific Drive folder.
+    Returns the file ID if found, or None.
+    """
+    try:
+        drive = build('drive', 'v3', credentials=creds)
+        escaped = title.replace("'", "\\'")
+        results = drive.files().list(
+            q=(f"name='{escaped}' and '{folder_id}' in parents "
+               f"and mimeType='{mime_type}' and trashed=false"),
+            fields='files(id, name)',
+            pageSize=5,
+        ).execute()
+        files = results.get('files', [])
+        return files[0]['id'] if files else None
+    except HttpError as e:
+        logger.warning(f"File search error: {e}")
         return None
 
 
-def create_google_sheet(creds, title, tsv_content):
-    """Create a Google Sheet from tab-separated content. Returns the URL."""
+def create_google_doc(creds, title, content, folder_id=None):
+    """Create a Google Doc in the given Drive folder. Returns the URL."""
+    try:
+        docs_service = build('docs', 'v1', credentials=creds)
+        drive_service = build('drive', 'v3', credentials=creds)
+
+        # Check if a doc with this title already exists in the folder
+        existing_id = None
+        if folder_id:
+            existing_id = find_existing_file(
+                creds, title, folder_id,
+                'application/vnd.google-apps.document'
+            )
+
+        if existing_id:
+            # Clear existing content and replace it
+            doc = docs_service.documents().get(documentId=existing_id).execute()
+            end_index = doc['body']['content'][-1]['endIndex'] - 1
+            if end_index > 1 and content:
+                docs_service.documents().batchUpdate(
+                    documentId=existing_id,
+                    body={'requests': [
+                        {'deleteContentRange': {'range': {'startIndex': 1, 'endIndex': end_index}}},
+                        {'insertText': {'location': {'index': 1}, 'text': content}},
+                    ]}
+                ).execute()
+            doc_id = existing_id
+            logger.info(f"Updated existing Google Doc: {title}")
+        else:
+            # Create new doc
+            doc = docs_service.documents().create(body={'title': title}).execute()
+            doc_id = doc['documentId']
+            if content:
+                docs_service.documents().batchUpdate(
+                    documentId=doc_id,
+                    body={'requests': [
+                        {'insertText': {'location': {'index': 1}, 'text': content}}
+                    ]}
+                ).execute()
+            # Move into folder
+            if folder_id:
+                drive_service.files().update(
+                    fileId=doc_id,
+                    addParents=folder_id,
+                    removeParents='root',
+                    fields='id, parents',
+                ).execute()
+            logger.info(f"Created Google Doc: {title}")
+
+        url = f"https://docs.google.com/document/d/{doc_id}/edit"
+        return url
+
+    except HttpError as e:
+        logger.error(f"Failed to create/update Google Doc: {e}")
+        return None
+
+
+def create_google_sheet(creds, title, tsv_content, folder_id=None):
+    """Create a Google Sheet in the given Drive folder. Returns the URL."""
     try:
         sheets_service = build('sheets', 'v4', credentials=creds)
+        drive_service  = build('drive', 'v3', credentials=creds)
 
         # Parse TSV into rows
         rows = []
@@ -459,6 +561,17 @@ def create_google_sheet(creds, title, tsv_content):
         }).execute()
 
         sheet_id = sheet['spreadsheetId']
+
+        # Move into folder
+        if folder_id:
+            drive_service.files().update(
+                fileId=sheet_id,
+                addParents=folder_id,
+                removeParents='root',
+                fields='id, parents',
+            ).execute()
+            logger.info(f"Created Google Sheet in folder: {title}")
+
         url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
         logger.info(f"Created Google Sheet: {title} → {url}")
         return url
@@ -686,9 +799,11 @@ def call_claude(email_data, admin_result=None, doc_url=None, doc_title=None, doc
 
     if doc_url and doc_title:
         kind = 'spreadsheet' if doc_type == 'sheet' else 'document'
-        prompt += (f"\n\nDOCUMENT CREATED: The {kind} '{doc_title}' has been created successfully."
+        prompt += (f"\n\nDOCUMENT CREATED: The {kind} '{doc_title}' has been saved to the "
+                   f"'Phelix - Virtual Employee' folder in Google Drive (shared with Oliver)."
                    f"\nURL: {doc_url}"
-                   f"\nPlease let the sender know it's ready and include the link in your reply.")
+                   f"\nPlease let the sender know it's ready, include the link, and mention "
+                   f"that Oliver can access it in the shared 'Phelix - Virtual Employee' Drive folder.")
     elif doc_url is False:
         prompt += ("\n\nDOCUMENT CREATION FAILED: An attempt was made to create the document "
                    "but a technical error occurred. Please apologise and let the sender know.")
@@ -851,6 +966,9 @@ def process_email(service, msg):
     # Ensure Oliver's shared calendar is accessible (fast no-op if already done)
     ensure_oliver_calendar_accessible(creds)
 
+    # Ensure Drive folder structure exists and is shared with Oliver
+    drive_folders = get_or_create_drive_folders(creds)
+
     # Use Claude to detect what actions this email needs
     intent = detect_intent(data)
 
@@ -861,9 +979,15 @@ def process_email(service, msg):
         doc_title, doc_content = generate_document_content(data, doc_type)
         if doc_title and doc_content:
             if doc_type == 'sheet':
-                doc_url = create_google_sheet(creds, doc_title, doc_content)
+                doc_url = create_google_sheet(
+                    creds, doc_title, doc_content,
+                    folder_id=drive_folders.get('sheets')
+                )
             else:
-                doc_url = create_google_doc(creds, doc_title, doc_content)
+                doc_url = create_google_doc(
+                    creds, doc_title, doc_content,
+                    folder_id=drive_folders.get('docs')
+                )
             if not doc_url:
                 doc_url = False
         else:

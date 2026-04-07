@@ -1,0 +1,13 @@
+# Never commit these — they contain secrets
+credentials.json
+token.json
+*.json.bak
+
+# Logs
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

@@ -1,0 +1,15 @@
+{
+  "_comment": "Claude Code MCP configuration for the Virtual Employee.",
+  "_comment2": "Passed to `claude -p --mcp-config mcp_config.json`.",
+  "_comment3": "Replace YOUR_EXA_API_KEY_HERE with a real key from https://exa.ai",
+
+  "mcpServers": {
+    "exa": {
+      "type": "sse",
+      "url": "https://mcp.exa.ai/mcp",
+      "headers": {
+        "x-api-key": "YOUR_EXA_API_KEY_HERE"
+      }
+    }
+  }
+}

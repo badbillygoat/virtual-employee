@@ -1,0 +1,41 @@
+# Virtual Employee systemd Service
+# ==================================
+# Runs the email monitor automatically on boot and restarts on crash.
+#
+# INSTALL:
+#   sudo cp virtual-employee.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable virtual-employee
+#   sudo systemctl start virtual-employee
+#
+# USEFUL COMMANDS:
+#   sudo systemctl status virtual-employee     # check it's running
+#   journalctl -u virtual-employee -f          # live log stream
+#   sudo systemctl restart virtual-employee    # restart after code changes
+
+[Unit]
+Description=Virtual Employee Email Monitor (Phelix Beeblebrox)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=otric
+WorkingDirectory=/home/otric/virtual-employee
+
+ExecStart=/usr/bin/python3 /home/otric/virtual-employee/monitor_email.py
+
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+Environment="HOME=/home/otric"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/otric/.local/bin:/home/otric/.npm-global/bin"
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=virtual-employee
+
+[Install]
+WantedBy=multi-user.target

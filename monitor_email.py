@@ -50,6 +50,11 @@ EMPLOYEE_NAME  = "Phelix Beeblebrox"
 EMPLOYEE_EMAIL = "phelixbeeblebrox@gmail.com"
 ADMIN_EMAIL    = "o.t.richman@gmail.com"   # Only this address can issue admin commands
 
+# Calendar settings
+OLIVER_EMAIL       = "o.t.richman@gmail.com"
+OLIVER_CALENDAR_ID = "o.t.richman@gmail.com"   # Oliver's primary calendar (shared with Phelix)
+OLIVER_TIMEZONE    = "America/New_York"          # ← change this if Oliver is in a different timezone
+
 # Senders/subjects to silently ignore
 SKIP_SENDERS = [
     'no-reply', 'noreply', 'mailer-daemon', 'postmaster',
@@ -471,6 +476,182 @@ def create_google_sheet(creds, title, tsv_content):
 
 
 # ─────────────────────────────────────────────
+#  Google Calendar
+# ─────────────────────────────────────────────
+
+from datetime import timedelta
+
+CREATE_EVENT_KEYWORDS = [
+    'schedule a meeting', 'schedule a call', 'schedule time',
+    'create a meeting', 'create a call', 'create an event', 'create a calendar',
+    'set up a meeting', 'set up a call', 'book a meeting', 'book a call',
+    'add to my calendar', 'add to calendar', 'calendar invite', 'send an invite',
+    'put on the calendar', 'block time', 'block off time',
+]
+CHECK_SCHEDULE_KEYWORDS = [
+    "what's my schedule", "what is my schedule", 'my schedule for',
+    'what do i have', "what's on my calendar", 'check my calendar',
+    'when am i free', 'am i free', 'my availability', 'check my availability',
+    'what are my meetings', 'do i have anything',
+]
+
+EVENT_DETAILS_PROMPT = """\
+You are {name}. Oliver has asked you to create a calendar event.
+
+His request (from {sender}):
+Subject: {subject}
+{body}
+
+Today is {today}. Oliver's timezone is {timezone}.
+
+Extract the event details and output them in EXACTLY this format (one field per line):
+TITLE: [descriptive event title]
+DATE: [YYYY-MM-DD — if a relative date like "next Tuesday" is given, convert it]
+START_TIME: [HH:MM in 24-hour format]
+END_TIME: [HH:MM in 24-hour format — if not stated, assume 1 hour after start]
+DESCRIPTION: [brief description of the event, or 'none']
+EXTRA_ATTENDEES: [comma-separated email addresses of additional guests beyond Oliver, or 'none']
+
+If any required detail is genuinely unclear, make a reasonable professional assumption.
+Do not add any text outside these six fields.
+"""
+
+
+def detect_calendar_request(email_data):
+    """Return 'create', 'check', or None."""
+    text = (email_data['body'] + ' ' + email_data['subject']).lower()
+    if any(k in text for k in CREATE_EVENT_KEYWORDS):
+        return 'create'
+    if any(k in text for k in CHECK_SCHEDULE_KEYWORDS):
+        return 'check'
+    return None
+
+
+def get_oliver_schedule(creds, days_ahead=7):
+    """
+    Fetch Oliver's calendar events for the next N days.
+    Returns a formatted string for Claude to reason about.
+    """
+    try:
+        service = build('calendar', 'v3', credentials=creds)
+        now = datetime.utcnow()
+        end = now + timedelta(days=days_ahead)
+
+        result = service.events().list(
+            calendarId=OLIVER_CALENDAR_ID,
+            timeMin=now.isoformat() + 'Z',
+            timeMax=end.isoformat() + 'Z',
+            maxResults=25,
+            singleEvents=True,
+            orderBy='startTime',
+        ).execute()
+
+        events = result.get('items', [])
+        if not events:
+            return f"Oliver has no events on his calendar in the next {days_ahead} days."
+
+        lines = [f"Oliver's calendar — next {days_ahead} days:"]
+        for ev in events:
+            start = ev['start'].get('dateTime', ev['start'].get('date', ''))
+            title = ev.get('summary', '(No title)')
+            lines.append(f"  • {start}  {title}")
+        return '\n'.join(lines)
+
+    except HttpError as e:
+        logger.error(f"Could not read Oliver's calendar: {e}")
+        return None
+
+
+def generate_event_details(email_data):
+    """Ask Claude to extract structured event details from the email. Returns a dict or None."""
+    today = datetime.now().strftime('%A, %B %-d, %Y')
+    prompt = EVENT_DETAILS_PROMPT.format(
+        name     = EMPLOYEE_NAME,
+        sender   = email_data['sender'],
+        subject  = email_data['subject'],
+        body     = email_data['body'],
+        today    = today,
+        timezone = OLIVER_TIMEZONE,
+    )
+    try:
+        result = subprocess.run(
+            ['claude', '-p', prompt],
+            capture_output=True, text=True, timeout=CLAUDE_TIMEOUT, cwd=BASE_DIR,
+            env={**os.environ, 'HOME': os.path.expanduser('~')},
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            logger.error(f"Claude failed extracting event details: {result.stderr[:200]}")
+            return None
+
+        details = {}
+        for line in result.stdout.strip().splitlines():
+            if ':' in line:
+                key, _, value = line.partition(':')
+                details[key.strip().upper()] = value.strip()
+
+        required = {'TITLE', 'DATE', 'START_TIME', 'END_TIME'}
+        if not required.issubset(details.keys()):
+            logger.error(f"Missing required event fields. Got: {details}")
+            return None
+
+        return details
+
+    except Exception as e:
+        logger.error(f"Error generating event details: {e}")
+        return None
+
+
+def create_calendar_event(creds, details):
+    """
+    Create a Google Calendar event on Phelix's calendar and invite Oliver.
+    Returns the event URL or None on failure.
+    """
+    try:
+        service = build('calendar', 'v3', credentials=creds)
+
+        attendees = [{'email': OLIVER_EMAIL}]
+        extra = details.get('EXTRA_ATTENDEES', 'none')
+        if extra and extra.lower() != 'none':
+            for addr in extra.split(','):
+                addr = addr.strip()
+                if addr and addr != OLIVER_EMAIL:
+                    attendees.append({'email': addr})
+
+        description = details.get('DESCRIPTION', '')
+        if description.lower() == 'none':
+            description = ''
+
+        event = {
+            'summary': details['TITLE'],
+            'description': description,
+            'start': {
+                'dateTime': f"{details['DATE']}T{details['START_TIME']}:00",
+                'timeZone': OLIVER_TIMEZONE,
+            },
+            'end': {
+                'dateTime': f"{details['DATE']}T{details['END_TIME']}:00",
+                'timeZone': OLIVER_TIMEZONE,
+            },
+            'attendees': attendees,
+            'reminders': {'useDefault': True},
+        }
+
+        created = service.events().insert(
+            calendarId='primary',
+            body=event,
+            sendUpdates='all',   # emails the invite to all attendees
+        ).execute()
+
+        url = created.get('htmlLink', '')
+        logger.info(f"Calendar event created: {details['TITLE']} on {details['DATE']} → {url}")
+        return url
+
+    except HttpError as e:
+        logger.error(f"Failed to create calendar event: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
 #  Claude Code invocation
 # ─────────────────────────────────────────────
 
@@ -513,7 +694,9 @@ and end with the sign-off. No extra commentary outside the email.
 """
 
 
-def call_claude(email_data, admin_result=None, doc_url=None, doc_title=None, doc_type=None):
+def call_claude(email_data, admin_result=None, doc_url=None, doc_title=None, doc_type=None,
+                calendar_action=None, calendar_url=None, calendar_details=None,
+                schedule_context=None):
     today  = datetime.now().strftime('%A, %B %-d, %Y')
     prompt = PROMPT_TEMPLATE.format(
         name    = EMPLOYEE_NAME,
@@ -535,6 +718,23 @@ def call_claude(email_data, admin_result=None, doc_url=None, doc_title=None, doc
     elif doc_url is False:
         prompt += ("\n\nDOCUMENT CREATION FAILED: An attempt was made to create the document "
                    "but a technical error occurred. Please apologise and let the sender know.")
+
+    if calendar_action == 'created' and calendar_url and calendar_details:
+        prompt += (f"\n\nCALENDAR EVENT CREATED: '{calendar_details['TITLE']}' on "
+                   f"{calendar_details['DATE']} from {calendar_details['START_TIME']} to "
+                   f"{calendar_details['END_TIME']} ({OLIVER_TIMEZONE})."
+                   f"\nEvent link: {calendar_url}"
+                   f"\nOliver has been sent a calendar invitation. "
+                   f"Please confirm the event details naturally in your reply and include the link.")
+    elif calendar_action == 'failed':
+        prompt += ("\n\nCALENDAR EVENT FAILED: An attempt was made to create the calendar event "
+                   "but a technical error occurred. Please apologise and let the sender know.")
+    elif calendar_action == 'check' and schedule_context:
+        prompt += (f"\n\nOLIVER'S SCHEDULE (for reference when answering):\n{schedule_context}"
+                   f"\nPlease answer the scheduling question using this information.")
+    elif calendar_action == 'check' and schedule_context is None:
+        prompt += ("\n\nSCHEDULE UNAVAILABLE: Could not read Oliver's calendar due to a technical "
+                   "error. Please apologise and suggest Oliver checks his calendar directly.")
 
     cmd = ['claude', '-p', prompt]
     if os.path.exists(MCP_CONFIG_FILE):
@@ -606,12 +806,33 @@ def process_email(service, msg):
             else:
                 doc_url = create_google_doc(creds, doc_title, doc_content)
             if not doc_url:
-                doc_url = False  # Signal failure to call_claude
+                doc_url = False
         else:
             doc_url = False
 
+    # Check for calendar requests
+    calendar_action  = None
+    calendar_url     = None
+    calendar_details = None
+    schedule_context = None
+    cal_type = detect_calendar_request(data)
+    if cal_type == 'create':
+        logger.info("Calendar create request detected")
+        calendar_details = generate_event_details(data)
+        if calendar_details:
+            calendar_url = create_calendar_event(creds, calendar_details)
+            calendar_action = 'created' if calendar_url else 'failed'
+        else:
+            calendar_action = 'failed'
+    elif cal_type == 'check':
+        logger.info("Calendar check request detected")
+        schedule_context = get_oliver_schedule(creds)
+        calendar_action  = 'check'
+
     reply = call_claude(data, admin_result=admin_result,
-                        doc_url=doc_url, doc_title=doc_title, doc_type=doc_type)
+                        doc_url=doc_url, doc_title=doc_title, doc_type=doc_type,
+                        calendar_action=calendar_action, calendar_url=calendar_url,
+                        calendar_details=calendar_details, schedule_context=schedule_context)
     if reply:
         if send_reply(service, msg, reply):
             mark_as_read(service, data['id'])

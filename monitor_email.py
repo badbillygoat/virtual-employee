@@ -452,6 +452,59 @@ def load_whitelist():
     return _email_whitelist
 
 
+# CC request keywords — any of these in the body triggers CC detection
+_CC_KEYWORDS = [
+    'cc ', 'cc:', 'c.c.', 'carbon copy', 'copy in ', 'copy to ', 'loop in ',
+    'loop in,', 'please copy', 'also copy', 'send a copy', 'include on this',
+    'include on the reply', 'cc them', 'cc her', 'cc him',
+]
+
+def parse_cc_request(email_data):
+    """
+    Detect CC requests from any whitelisted sender.
+    Looks for CC keywords in the body and extracts the email addresses to copy.
+
+    Returns a dict:
+        {'addresses': ['alice@example.com', ...], 'add_to_whitelist': True/False}
+    or None if no CC request detected.
+
+    Only Oliver (ADMIN_EMAIL) can trigger auto-add-to-whitelist for CC'd addresses.
+    """
+    body     = email_data['body'].lower()
+    is_oliver = extract_email_address(email_data['sender']) == ADMIN_EMAIL
+
+    if not any(kw in body for kw in _CC_KEYWORDS):
+        return None
+
+    sender_addr = extract_email_address(email_data['sender']).lower()
+    all_emails  = [e.lower() for e in EMAIL_RE.findall(email_data['body'])]
+
+    # Collect email addresses that are not Phelix's own or the sender's
+    cc_emails = [
+        e for e in all_emails
+        if e != EMPLOYEE_EMAIL.lower() and e != sender_addr
+    ]
+    # Deduplicate while preserving order
+    seen = set()
+    cc_emails = [e for e in cc_emails if not (e in seen or seen.add(e))]
+
+    if not cc_emails:
+        return None
+
+    # Oliver can optionally request auto-whitelist of CC'd addresses
+    add_to_whitelist = False
+    if is_oliver:
+        whitelist_hints = [
+            'add to whitelist', 'whitelist them', 'whitelist her', 'whitelist him',
+            'also whitelist', 'add them to', 'add her to', 'add him to',
+            'and whitelist', 'to the whitelist',
+        ]
+        add_to_whitelist = any(h in body for h in whitelist_hints)
+
+    logger.info(f"CC request detected: {cc_emails} (add_to_whitelist={add_to_whitelist})")
+    return {'addresses': cc_emails, 'add_to_whitelist': add_to_whitelist}
+
+
 def extract_email_address(sender_field):
     """Pull the bare email address out of a From: header like 'Alice <alice@example.com>'."""
     import re
@@ -493,7 +546,11 @@ def mark_as_read(service, msg_id):
         logger.error(f"Could not mark {msg_id} as read: {e}")
 
 
-def send_reply(service, original, reply_text):
+def send_reply(service, original, reply_text, cc_addresses=None):
+    """
+    Send a reply to 'original'. Optionally CC additional addresses.
+    cc_addresses should be a list of email strings, e.g. ['alice@example.com'].
+    """
     headers = {h['name'].lower(): h['value'] for h in original['payload'].get('headers', [])}
     to_addr = headers.get('from', '')
     subject = headers.get('subject', '')
@@ -510,6 +567,9 @@ def send_reply(service, original, reply_text):
     if msg_id:
         msg['In-Reply-To'] = msg_id
         msg['References']  = msg_id
+    if cc_addresses:
+        msg['Cc'] = ', '.join(cc_addresses)
+        logger.info(f"CC: {', '.join(cc_addresses)}")
     msg.attach(MIMEText(reply_text, 'plain', 'utf-8'))
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')
@@ -969,7 +1029,7 @@ and end with the sign-off. No extra commentary outside the email.
 
 def call_claude(email_data, admin_result=None, doc_url=None, doc_title=None, doc_type=None,
                 calendar_action=None, calendar_url=None, calendar_details=None,
-                schedule_context=None):
+                schedule_context=None, cc_addresses=None, cc_whitelisted=None):
     today  = datetime.now().strftime('%A, %B %-d, %Y')
     prompt = PROMPT_TEMPLATE.format(
         name    = EMPLOYEE_NAME,
@@ -1010,6 +1070,14 @@ def call_claude(email_data, admin_result=None, doc_url=None, doc_title=None, doc
     elif calendar_action == 'check' and schedule_context is None:
         prompt += ("\n\nSCHEDULE UNAVAILABLE: Could not read Oliver's calendar due to a technical "
                    "error. Please apologise and suggest Oliver checks his calendar directly.")
+
+    # Inform Claude about any CC addresses on this reply
+    if cc_addresses:
+        cc_str = ', '.join(cc_addresses)
+        prompt += f"\n\nCC: This reply will be CC'd to: {cc_str}. Acknowledge this briefly and naturally in your reply (e.g. 'I've copied Alice on this reply')."
+        if cc_whitelisted:
+            wl_str = ', '.join(cc_whitelisted)
+            prompt += f" {wl_str} {'has' if len(cc_whitelisted) == 1 else 'have'} also been added to your email whitelist so they can email me directly in future."
 
     # Inject URL research permissions into the prompt
     if _url_whitelist:
@@ -1171,6 +1239,19 @@ def process_email(service, msg):
     # Ensure Drive folder structure exists and is shared with Oliver
     drive_folders = get_or_create_drive_folders(creds)
 
+    # Check for CC requests
+    cc_addresses   = []
+    cc_whitelisted = []
+    cc_req = parse_cc_request(data)
+    if cc_req:
+        cc_addresses = cc_req['addresses']
+        if cc_req['add_to_whitelist']:
+            for addr in cc_addresses:
+                execute_admin_command({'action': 'add', 'target': addr}, creds)
+                cc_whitelisted.append(addr)
+            if cc_whitelisted:
+                refresh_whitelists(creds)
+
     # Use Claude to detect what actions this email needs
     intent = detect_intent(data)
 
@@ -1217,9 +1298,11 @@ def process_email(service, msg):
     reply = call_claude(data, admin_result=admin_result,
                         doc_url=doc_url, doc_title=doc_title, doc_type=doc_type,
                         calendar_action=calendar_action, calendar_url=calendar_url,
-                        calendar_details=calendar_details, schedule_context=schedule_context)
+                        calendar_details=calendar_details, schedule_context=schedule_context,
+                        cc_addresses=cc_addresses or None,
+                        cc_whitelisted=cc_whitelisted or None)
     if reply:
-        if send_reply(service, msg, reply):
+        if send_reply(service, msg, reply, cc_addresses=cc_addresses or None):
             mark_as_read(service, data['id'])
             logger.info("✓ Done.")
         else:

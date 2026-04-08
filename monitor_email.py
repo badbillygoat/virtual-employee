@@ -327,7 +327,41 @@ def parse_email(msg):
 # ─────────────────────────────────────────────
 
 EMAIL_RE = re.compile(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b')
-URL_RE   = re.compile(r'https?://[^\s<>"\']+')
+
+# Matches full URLs (https://example.com/path) AND bare domains (example.com)
+# Bare-domain pattern requires at least one dot and a recognised TLD (2+ chars).
+URL_RE        = re.compile(r'https?://[^\s<>"\',\[\]]+')
+BARE_DOMAIN_RE = re.compile(
+    r'\b(?!.*@)'                          # not part of an email address
+    r'(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)'  # subdomain(s)
+    r'+[a-zA-Z]{2,}\b'                    # TLD
+)
+
+def _extract_sites(text):
+    """
+    Return a de-duplicated list of site strings (full URLs or bare domains)
+    found in text, normalised to lowercase and stripped of trailing punctuation.
+    Full https?:// URLs take priority; bare domains are collected as fallback.
+    Excludes plain email addresses.
+    """
+    full_urls = [u.rstrip('.,;)>\'"') for u in URL_RE.findall(text)]
+    if full_urls:
+        seen = set(); result = []
+        for u in full_urls:
+            if u not in seen:
+                seen.add(u); result.append(u)
+        return result
+
+    # Fall back to bare domains, but exclude anything that looks like an email
+    email_addrs = {m.lower() for m in EMAIL_RE.findall(text)}
+    domains = []
+    seen = set()
+    for m in BARE_DOMAIN_RE.findall(text):
+        d = m.lower().rstrip('.,;)>\'"')
+        if d not in seen and d not in email_addrs and '.' in d:
+            seen.add(d); domains.append(d)
+    return domains
+
 
 def parse_admin_command(email_data):
     """
@@ -336,6 +370,11 @@ def parse_admin_command(email_data):
     Supported actions:
       Email whitelist : add / remove / list
       URL whitelist   : add_url / remove_url / list_urls
+
+    URL commands support:
+      • Full URLs:    "add https://nytimes.com to research whitelist"
+      • Bare domains: "add nytimes.com, wsj.com to the research whitelist"
+      • Bulk lists:   a single command adds ALL sites found in the email
     """
     if extract_email_address(email_data['sender']) != ADMIN_EMAIL:
         return None
@@ -346,19 +385,20 @@ def parse_admin_command(email_data):
     remove_words = ['remove', 'delete', 'block', 'revoke', 'exclude', 'ban']
 
     # ── URL whitelist commands ─────────────────────────────
-    # Trigger words that indicate the user is talking about research / web URLs
     url_context_words = [
         'research whitelist', 'url whitelist', 'research list',
         'web research', 'allowed url', 'allowed website', 'allowed site',
-        'research url', 'research site',
+        'research url', 'research site', 'whitelisted for your research',
+        'whitelisted for research', 'research purposes',
     ]
     url_context = any(p in body for p in url_context_words)
-    found_urls  = [u.rstrip('.,;)>') for u in URL_RE.findall(email_data['body'])]
+    found_sites = _extract_sites(email_data['body'])
 
-    if found_urls and url_context and any(w in body for w in add_words):
-        return {'action': 'add_url', 'target': found_urls[0]}
-    if found_urls and url_context and any(w in body for w in remove_words):
-        return {'action': 'remove_url', 'target': found_urls[0]}
+    if found_sites and url_context and any(w in body for w in add_words):
+        # Return all found sites so they can all be added in one command
+        return {'action': 'add_url', 'targets': found_sites}
+    if found_sites and url_context and any(w in body for w in remove_words):
+        return {'action': 'remove_url', 'targets': found_sites}
     if any(p in body for p in ['show research', 'list research', 'show url',
                                 'list url', 'what urls', 'what websites',
                                 'what sites can', 'list web']):
@@ -416,22 +456,44 @@ def execute_admin_command(command, creds):
 
     # ── URL / research whitelist ───────────────────────────
     elif action == 'add_url':
-        target   = command['target']
-        existing = [u.lower() for u in read_sheet_list(creds, sheet_id, URL_WHITELIST_TAB)]
-        if target.lower() in existing:
-            return f"Note: '{target}' was already on the research whitelist — no change made."
-        append_to_sheet_list(creds, sheet_id, URL_WHITELIST_TAB, target)
-        logger.info(f"Admin: added {target} to URL whitelist")
-        return f"Done — I've added '{target}' to the research whitelist. I can now reference that site when answering emails."
+        # Support both singular 'target' (legacy) and plural 'targets' (bulk)
+        targets  = command.get('targets') or [command.get('target', '')]
+        targets  = [t for t in targets if t]
+        existing = {u.lower() for u in read_sheet_list(creds, sheet_id, URL_WHITELIST_TAB)}
+        added, skipped = [], []
+        for target in targets:
+            if target.lower() in existing:
+                skipped.append(target)
+            else:
+                append_to_sheet_list(creds, sheet_id, URL_WHITELIST_TAB, target)
+                existing.add(target.lower())
+                added.append(target)
+                logger.info(f"Admin: added {target} to URL whitelist")
+        parts = []
+        if added:
+            parts.append(f"Added {len(added)} site(s) to the research whitelist: " +
+                         ', '.join(added))
+        if skipped:
+            parts.append(f"{len(skipped)} already present (skipped): " +
+                         ', '.join(skipped))
+        return ' — '.join(parts) or "No changes made."
 
     elif action == 'remove_url':
-        target  = command['target']
-        removed = remove_from_sheet_list(creds, sheet_id, URL_WHITELIST_TAB, target)
+        targets  = command.get('targets') or [command.get('target', '')]
+        targets  = [t for t in targets if t]
+        removed, not_found = [], []
+        for target in targets:
+            if remove_from_sheet_list(creds, sheet_id, URL_WHITELIST_TAB, target):
+                removed.append(target)
+                logger.info(f"Admin: removed {target} from URL whitelist")
+            else:
+                not_found.append(target)
+        parts = []
         if removed:
-            logger.info(f"Admin: removed {target} from URL whitelist")
-            return f"Done — I've removed '{target}' from the research whitelist."
-        else:
-            return f"Note: '{target}' was not found on the research whitelist — no change made."
+            parts.append(f"Removed {len(removed)} site(s): " + ', '.join(removed))
+        if not_found:
+            parts.append(f"{len(not_found)} not found: " + ', '.join(not_found))
+        return ' — '.join(parts) or "No changes made."
 
     elif action == 'list_urls':
         urls = read_sheet_list(creds, sheet_id, URL_WHITELIST_TAB)

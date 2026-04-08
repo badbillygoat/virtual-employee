@@ -2,7 +2,11 @@
 credentials.json
 token.json
 drive_folders.json
+phelix_config.json   # stores config Google Sheet ID — gitignored to keep it off the public repo
 *.json.bak
+
+# Whitelist is now managed in Google Sheets (not in this repo)
+whitelist.txt
 
 # Logs
 logs/

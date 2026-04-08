@@ -37,12 +37,25 @@ SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
 ]
 
-BASE_DIR          = os.path.expanduser('~/virtual-employee')
-TOKEN_FILE        = os.path.join(BASE_DIR, 'token.json')
-LOG_FILE          = os.path.join(BASE_DIR, 'logs', 'monitor.log')
-MCP_CONFIG_FILE   = os.path.join(BASE_DIR, 'mcp_config.json')
-WHITELIST_FILE      = os.path.join(BASE_DIR, 'whitelist.txt')
+BASE_DIR            = os.path.expanduser('~/virtual-employee')
+TOKEN_FILE          = os.path.join(BASE_DIR, 'token.json')
+LOG_FILE            = os.path.join(BASE_DIR, 'logs', 'monitor.log')
+MCP_CONFIG_FILE     = os.path.join(BASE_DIR, 'mcp_config.json')
 DRIVE_FOLDERS_FILE  = os.path.join(BASE_DIR, 'drive_folders.json')
+PHELIX_CONFIG_FILE  = os.path.join(BASE_DIR, 'phelix_config.json')  # gitignored — stores sheet ID
+
+# Configuration Google Sheet (lives on Phelix's Drive, shared with Oliver)
+CONFIG_SHEET_NAME   = 'Phelix - Configuration'
+EMAIL_WHITELIST_TAB = 'Email Whitelist'
+URL_WHITELIST_TAB   = 'URL Whitelist'
+
+# ─────────────────────────────────────────────
+#  In-memory caches (refreshed each polling cycle)
+# ─────────────────────────────────────────────
+
+_email_whitelist: set  = set()   # lowercase email addresses
+_url_whitelist:   list = []      # approved research URLs/domains
+_config_sheet_id: str  = ''      # Spreadsheet ID of "Phelix - Configuration"
 
 # Drive folder structure
 ROOT_FOLDER_NAME = 'Phelix - Virtual Employee'
@@ -93,6 +106,156 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+#  Configuration Sheet helpers
+# ─────────────────────────────────────────────
+
+def get_or_create_config_sheet(creds):
+    """
+    Ensure the 'Phelix - Configuration' spreadsheet exists in Phelix's Drive
+    and has 'Email Whitelist' and 'URL Whitelist' tabs. Returns the sheet ID.
+    Caches the ID in phelix_config.json (gitignored) so startup is instant.
+    """
+    global _config_sheet_id
+    sheets_svc = build('sheets', 'v4', credentials=creds)
+    drive_svc  = build('drive',  'v3', credentials=creds)
+
+    # Try cached ID first
+    if os.path.exists(PHELIX_CONFIG_FILE):
+        with open(PHELIX_CONFIG_FILE) as f:
+            cached = json.load(f)
+        sheet_id = cached.get('config_sheet_id', '')
+        if sheet_id:
+            try:
+                sheets_svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+                _config_sheet_id = sheet_id
+                return sheet_id
+            except HttpError:
+                logger.info("Cached config sheet not found — recreating")
+
+    # Create new spreadsheet with both tabs
+    spreadsheet = sheets_svc.spreadsheets().create(body={
+        'properties': {'title': CONFIG_SHEET_NAME},
+        'sheets': [
+            {'properties': {'title': EMAIL_WHITELIST_TAB}},
+            {'properties': {'title': URL_WHITELIST_TAB}},
+        ],
+    }).execute()
+    sheet_id = spreadsheet['spreadsheetId']
+
+    # Add column headers and seed email whitelist with Oliver's address
+    sheets_svc.spreadsheets().values().batchUpdate(
+        spreadsheetId=sheet_id,
+        body={'valueInputOption': 'RAW', 'data': [
+            {'range': f'{EMAIL_WHITELIST_TAB}!A1', 'values': [['Email Address']]},
+            {'range': f'{EMAIL_WHITELIST_TAB}!A2', 'values': [[ADMIN_EMAIL]]},
+            {'range': f'{URL_WHITELIST_TAB}!A1',   'values': [['URL / Domain']]},
+        ]},
+    ).execute()
+
+    # Share with Oliver as editor
+    try:
+        drive_svc.permissions().create(
+            fileId=sheet_id,
+            body={'type': 'user', 'role': 'writer', 'emailAddress': OLIVER_EMAIL},
+            sendNotificationEmail=False,
+        ).execute()
+        logger.info(f"Config sheet created and shared with {OLIVER_EMAIL}")
+    except HttpError as e:
+        logger.warning(f"Could not share config sheet with Oliver: {e}")
+
+    # Cache ID
+    cfg = {}
+    if os.path.exists(PHELIX_CONFIG_FILE):
+        with open(PHELIX_CONFIG_FILE) as f:
+            cfg = json.load(f)
+    cfg['config_sheet_id'] = sheet_id
+    with open(PHELIX_CONFIG_FILE, 'w') as f:
+        json.dump(cfg, f, indent=2)
+
+    logger.info(f"Config sheet created: https://docs.google.com/spreadsheets/d/{sheet_id}/edit")
+    _config_sheet_id = sheet_id
+    return sheet_id
+
+
+def read_sheet_list(creds, sheet_id, tab_name):
+    """
+    Read column A of a Sheet tab (skipping the header row).
+    Returns a list of non-empty strings.
+    """
+    try:
+        sheets_svc = build('sheets', 'v4', credentials=creds)
+        result = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f'{tab_name}!A:A',
+        ).execute()
+        rows = result.get('values', [])
+        # Row 0 is the header; skip it
+        return [row[0].strip() for row in rows[1:] if row and row[0].strip()]
+    except HttpError as e:
+        logger.error(f"Error reading {tab_name}: {e}")
+        return []
+
+
+def append_to_sheet_list(creds, sheet_id, tab_name, value):
+    """Append a new value to column A of a Sheet tab."""
+    try:
+        sheets_svc = build('sheets', 'v4', credentials=creds)
+        sheets_svc.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f'{tab_name}!A:A',
+            valueInputOption='RAW',
+            body={'values': [[value]]},
+        ).execute()
+        return True
+    except HttpError as e:
+        logger.error(f"Error appending to {tab_name}: {e}")
+        return False
+
+
+def remove_from_sheet_list(creds, sheet_id, tab_name, value):
+    """
+    Find and clear the row containing 'value' (case-insensitive) in column A.
+    Returns True if removed, False if not found.
+    """
+    try:
+        sheets_svc = build('sheets', 'v4', credentials=creds)
+        result = sheets_svc.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f'{tab_name}!A:A',
+        ).execute()
+        rows = result.get('values', [])
+        for i, row in enumerate(rows):
+            if row and row[0].strip().lower() == value.lower():
+                row_num = i + 1  # 1-based
+                sheets_svc.spreadsheets().values().clear(
+                    spreadsheetId=sheet_id,
+                    range=f'{tab_name}!A{row_num}:Z{row_num}',
+                ).execute()
+                return True
+        return False
+    except HttpError as e:
+        logger.error(f"Error removing from {tab_name}: {e}")
+        return False
+
+
+def refresh_whitelists(creds):
+    """
+    Reload email and URL whitelists from the config Google Sheet.
+    Called once per polling cycle in main(). Safe to call even on first run.
+    """
+    global _email_whitelist, _url_whitelist, _config_sheet_id
+    try:
+        sheet_id = get_or_create_config_sheet(creds)
+        emails   = read_sheet_list(creds, sheet_id, EMAIL_WHITELIST_TAB)
+        urls     = read_sheet_list(creds, sheet_id, URL_WHITELIST_TAB)
+        _email_whitelist = {e.lower() for e in emails}
+        _url_whitelist   = urls
+        logger.debug(f"Whitelists refreshed: {len(_email_whitelist)} emails, {len(_url_whitelist)} URLs")
+    except Exception as e:
+        logger.error(f"Could not refresh whitelists from Sheet: {e} — using cached values")
 
 
 # ─────────────────────────────────────────────
@@ -164,106 +327,129 @@ def parse_email(msg):
 # ─────────────────────────────────────────────
 
 EMAIL_RE = re.compile(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b')
+URL_RE   = re.compile(r'https?://[^\s<>"\']+')
 
 def parse_admin_command(email_data):
     """
-    If the email is from the admin (Oliver), look for whitelist management commands.
-    Returns a dict like {'action': 'add', 'target': 'alice@example.com'}
-    or {'action': 'list'}, or None if no command detected.
+    If the email is from the admin (Oliver), detect whitelist management commands.
+
+    Supported actions:
+      Email whitelist : add / remove / list
+      URL whitelist   : add_url / remove_url / list_urls
     """
     if extract_email_address(email_data['sender']) != ADMIN_EMAIL:
         return None
 
-    body  = email_data['body'].lower()
-    # Find any email addresses mentioned in the body (excluding Phelix's own)
-    found = [e.lower() for e in EMAIL_RE.findall(email_data['body'])
-             if e.lower() != EMPLOYEE_EMAIL and e.lower() != ADMIN_EMAIL]
+    body = email_data['body'].lower()
 
     add_words    = ['add', 'allow', 'whitelist', 'approve', 'include']
     remove_words = ['remove', 'delete', 'block', 'revoke', 'exclude', 'ban']
-    list_phrases = ['show whitelist', 'list whitelist', 'who can email',
-                    'who is on the whitelist', 'who is allowed']
 
-    if found and any(w in body for w in add_words):
-        return {'action': 'add', 'target': found[0]}
+    # ── URL whitelist commands ─────────────────────────────
+    # Trigger words that indicate the user is talking about research / web URLs
+    url_context_words = [
+        'research whitelist', 'url whitelist', 'research list',
+        'web research', 'allowed url', 'allowed website', 'allowed site',
+        'research url', 'research site',
+    ]
+    url_context = any(p in body for p in url_context_words)
+    found_urls  = [u.rstrip('.,;)>') for u in URL_RE.findall(email_data['body'])]
 
-    if found and any(w in body for w in remove_words):
-        return {'action': 'remove', 'target': found[0]}
+    if found_urls and url_context and any(w in body for w in add_words):
+        return {'action': 'add_url', 'target': found_urls[0]}
+    if found_urls and url_context and any(w in body for w in remove_words):
+        return {'action': 'remove_url', 'target': found_urls[0]}
+    if any(p in body for p in ['show research', 'list research', 'show url',
+                                'list url', 'what urls', 'what websites',
+                                'what sites can', 'list web']):
+        return {'action': 'list_urls'}
 
-    if any(p in body for p in list_phrases):
+    # ── Email whitelist commands ───────────────────────────
+    found_emails = [e.lower() for e in EMAIL_RE.findall(email_data['body'])
+                    if e.lower() != EMPLOYEE_EMAIL and e.lower() != ADMIN_EMAIL]
+
+    if found_emails and any(w in body for w in add_words):
+        return {'action': 'add', 'target': found_emails[0]}
+    if found_emails and any(w in body for w in remove_words):
+        return {'action': 'remove', 'target': found_emails[0]}
+    if any(p in body for p in ['show whitelist', 'list whitelist', 'who can email',
+                                'who is on the whitelist', 'who is allowed']):
         return {'action': 'list'}
 
     return None
 
 
-def execute_admin_command(command):
+def execute_admin_command(command, creds):
     """
-    Carry out an admin whitelist command and return a plain-English result
-    string that gets passed to Claude so Phelix can confirm it naturally.
+    Carry out an admin whitelist command (email or URL) against the config Google Sheet.
+    Returns a plain-English result string that Claude uses to confirm the action to Oliver.
     """
-    action = command['action']
+    action   = command['action']
+    sheet_id = get_or_create_config_sheet(creds)
 
-    # Read the current file lines (preserving comments)
-    comment_lines = []
-    addresses = set()
-    if os.path.exists(WHITELIST_FILE):
-        with open(WHITELIST_FILE, 'r') as f:
-            for line in f:
-                stripped = line.strip()
-                if stripped.startswith('#') or not stripped:
-                    comment_lines.append(line)
-                else:
-                    addresses.add(stripped.lower())
-
-    def save():
-        with open(WHITELIST_FILE, 'w') as f:
-            f.writelines(comment_lines)
-            for addr in sorted(addresses):
-                f.write(addr + '\n')
-
+    # ── Email whitelist ────────────────────────────────────
     if action == 'add':
-        target = command['target']
-        if target in addresses:
-            return f"Note: '{target}' was already on the whitelist — no change made."
-        addresses.add(target)
-        save()
-        logger.info(f"Admin: added {target} to whitelist")
-        return f"Done — I've added '{target}' to the whitelist. They can now email me."
+        target   = command['target'].lower()
+        existing = {e.lower() for e in read_sheet_list(creds, sheet_id, EMAIL_WHITELIST_TAB)}
+        if target in existing:
+            return f"Note: '{target}' was already on the email whitelist — no change made."
+        append_to_sheet_list(creds, sheet_id, EMAIL_WHITELIST_TAB, target)
+        logger.info(f"Admin: added {target} to email whitelist")
+        return f"Done — I've added '{target}' to the email whitelist. They can now email me."
 
     elif action == 'remove':
-        target = command['target']
-        if target not in addresses:
-            return f"Note: '{target}' was not found on the whitelist — no change made."
-        addresses.discard(target)
-        save()
-        logger.info(f"Admin: removed {target} from whitelist")
-        return f"Done — I've removed '{target}' from the whitelist. Their emails will be ignored."
+        target  = command['target'].lower()
+        removed = remove_from_sheet_list(creds, sheet_id, EMAIL_WHITELIST_TAB, target)
+        if removed:
+            logger.info(f"Admin: removed {target} from email whitelist")
+            return f"Done — I've removed '{target}' from the email whitelist. Their emails will be ignored."
+        else:
+            return f"Note: '{target}' was not found on the email whitelist — no change made."
 
     elif action == 'list':
+        addresses = read_sheet_list(creds, sheet_id, EMAIL_WHITELIST_TAB)
         if addresses:
             formatted = '\n'.join(f"  • {a}" for a in sorted(addresses))
-            return f"Current whitelist ({len(addresses)} address(es)):\n{formatted}"
+            return f"Current email whitelist ({len(addresses)} address(es)):\n{formatted}"
         else:
-            return "The whitelist file is empty, so all senders are currently allowed."
+            return "The email whitelist is empty — all senders are currently allowed."
+
+    # ── URL / research whitelist ───────────────────────────
+    elif action == 'add_url':
+        target   = command['target']
+        existing = [u.lower() for u in read_sheet_list(creds, sheet_id, URL_WHITELIST_TAB)]
+        if target.lower() in existing:
+            return f"Note: '{target}' was already on the research whitelist — no change made."
+        append_to_sheet_list(creds, sheet_id, URL_WHITELIST_TAB, target)
+        logger.info(f"Admin: added {target} to URL whitelist")
+        return f"Done — I've added '{target}' to the research whitelist. I can now reference that site when answering emails."
+
+    elif action == 'remove_url':
+        target  = command['target']
+        removed = remove_from_sheet_list(creds, sheet_id, URL_WHITELIST_TAB, target)
+        if removed:
+            logger.info(f"Admin: removed {target} from URL whitelist")
+            return f"Done — I've removed '{target}' from the research whitelist."
+        else:
+            return f"Note: '{target}' was not found on the research whitelist — no change made."
+
+    elif action == 'list_urls':
+        urls = read_sheet_list(creds, sheet_id, URL_WHITELIST_TAB)
+        if urls:
+            formatted = '\n'.join(f"  • {u}" for u in urls)
+            return f"Current research whitelist ({len(urls)} URL(s)):\n{formatted}"
+        else:
+            return "The research whitelist is empty — I'm not currently authorised to fetch any external websites."
 
     return "Unknown command."
 
 
 def load_whitelist():
     """
-    Load allowed sender addresses from whitelist.txt.
-    Returns a set of lowercase email addresses, or an empty set
-    if the file doesn't exist (meaning: allow everyone).
+    Return the email whitelist from the in-memory cache.
+    The cache is refreshed at the start of each polling cycle by refresh_whitelists().
     """
-    if not os.path.exists(WHITELIST_FILE):
-        return set()
-    with open(WHITELIST_FILE, 'r') as f:
-        addresses = set()
-        for line in f:
-            line = line.strip().lower()
-            if line and not line.startswith('#'):
-                addresses.add(line)
-    return addresses
+    return _email_whitelist
 
 
 def extract_email_address(sender_field):
@@ -278,8 +464,8 @@ def extract_email_address(sender_field):
 def should_skip(e):
     s, sub = e['sender'].lower(), e['subject'].lower()
 
-    # 1. Whitelist check — if whitelist.txt exists and is non-empty,
-    #    only process emails from listed addresses.
+    # 1. Whitelist check — load from the in-memory cache (refreshed from Google Sheets
+    #    at the start of each polling cycle).
     whitelist = load_whitelist()
     if whitelist:
         sender_addr = extract_email_address(e['sender'])
@@ -825,6 +1011,20 @@ def call_claude(email_data, admin_result=None, doc_url=None, doc_title=None, doc
         prompt += ("\n\nSCHEDULE UNAVAILABLE: Could not read Oliver's calendar due to a technical "
                    "error. Please apologise and suggest Oliver checks his calendar directly.")
 
+    # Inject URL research permissions into the prompt
+    if _url_whitelist:
+        allowed = '\n'.join(f'  - {u}' for u in _url_whitelist)
+        prompt += (
+            f"\n\nRESEARCH PERMISSIONS: You are authorised to fetch and cite content "
+            f"from the following approved URLs only:\n{allowed}\n"
+            f"Do NOT access or cite any website not on this list."
+        )
+    else:
+        prompt += (
+            "\n\nRESEARCH PERMISSIONS: No external websites are currently approved for "
+            "research. Answer from your training knowledge only — do not fetch any URLs."
+        )
+
     cmd = ['claude', '-p', prompt]
     if os.path.exists(MCP_CONFIG_FILE):
         cmd.extend(['--mcp-config', MCP_CONFIG_FILE])
@@ -957,8 +1157,10 @@ def process_email(service, msg):
     admin_cmd = parse_admin_command(data)
     if admin_cmd:
         logger.info(f"Admin command detected: {admin_cmd}")
-        admin_result = execute_admin_command(admin_cmd)
+        admin_result = execute_admin_command(admin_cmd, creds)
         logger.info(f"Admin result: {admin_result}")
+        # Refresh caches so the change takes effect immediately this cycle
+        refresh_whitelists(creds)
 
     # Check for document creation requests
     doc_url = None
@@ -1039,7 +1241,15 @@ def main():
     while True:
         try:
             service = get_gmail_service()
-            unread  = get_unread_emails(service)
+
+            # Refresh whitelists from the config Google Sheet once per cycle
+            try:
+                creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+                refresh_whitelists(creds)
+            except Exception as e:
+                logger.warning(f"Whitelist refresh skipped: {e}")
+
+            unread = get_unread_emails(service)
             if unread:
                 logger.info(f"Found {len(unread)} unread email(s)")
                 for msg in unread:
